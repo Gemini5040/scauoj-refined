@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         华农 OJ 美化 · SCAU OJ Refined
 // @namespace    https://acm.scau.edu.cn/uoj8000/
-// @version      2.35.0
+// @version      2.36.0
 // @description  给华南农业大学 OJ（acm.scau.edu.cn/uoj8000）重绘外观：登录页/个人信息/目录树/题库与题面排版、状态徽章、代码框增强，并修掉卡死的等待页
 // @author       Gemini5040
 // @match        https://acm.scau.edu.cn/uoj8000/*
@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.35.0';
+  const VERSION = '2.36.0';
 
   // 本地预览用；正常访问只认华农 OJ 域名
   const IS_PREVIEW = window.__SOJ_PREVIEW__ === true;
@@ -3340,36 +3340,51 @@ html.soj-content textarea.soj-editor::-moz-selection{
     content.insertBefore(bar, content.firstChild);
   }
 
-  // 「返回上一页」：内容页跑在 iframe 里，history.back() 经常是空操作
-  // （这个 frame 自己没有上一条记录，或者在页面里被 window.open 打开的）。
-  // 所以先试 referrer，再试 history.back()，都没动就回到首页。
+  // 「返回上一页」：
+  // 优先用 history.back()——它只是把历史指针前移，不会新增条目，
+  // 配合「DELAY/冷却等中转页一律 location.replace 前进」，历史里根本没有
+  // 中转页，连点返回只会一路退出（题目→题表→主页），不会在「题目↔列表」
+  // 之间打转。早期版本优先用 document.referrer 做 location.href 跳转，
+  // 每点一次都【新增】一条历史，题目页又常引用列表页，于是越点越绕、
+  // 形成死循环。只有 history.back() 确实没动（frame 内已到历史起点）时，
+  // 才退回 referrer，再退回主页。
   function goBackOne() {
     const here = location.href;
 
     let ref = '';
     try { ref = document.referrer || ''; } catch (e) { ref = ''; }
     const sameSite = ref.indexOf(location.origin) === 0;
-    const useful = sameSite && ref !== here && !/mainMenu\.html/i.test(ref);
+    // DELAY 等待页（..._DELAY4/6/8.html）和服务端冷却页（...PUBLIC.html?waitForSeconds=N）
+    // 都是临时中转页，绝不能当作返回目标。
+    const isTransient = /_DELAY\d*\.html|[?&]waitForSeco/i.test(ref);
+    const useful = sameSite && ref !== here && !/mainMenu\.html/i.test(ref) && !isTransient;
 
-    if (useful) { location.href = ref; return; }
-
-    try { history.back(); } catch (e) { /* ignore */ }
-
-    setTimeout(function () {
-      let now = '';
-      try { now = location.href; } catch (e) { now = here; }
-      if (now !== here) return;                 // 真的回去了
-
-      // 兜底：让外层框架把右侧切回主页面，而不是把整个 shell 塞进 iframe
+    const goHome = function () {
       try {
         if (window.parent && window.parent !== window) {
           const right = window.parent.document.getElementById('rightMain');
           if (right) { right.src = '/uoj8000/mainPage.html'; return; }
         }
       } catch (e) { /* 跨域就放弃 */ }
-
       location.href = '/uoj8000/mainPage.html';
-    }, 260);
+    };
+
+    // frame 内确实有上一条历史：先走 history.back()。
+    if (history.length > 1) {
+      try { history.back(); } catch (e) { /* ignore */ }
+      setTimeout(function () {
+        let now = '';
+        try { now = location.href; } catch (e) { now = here; }
+        if (now !== here) return;               // 真的回去了
+        if (useful) { location.href = ref; return; }
+        goHome();
+      }, 300);
+      return;
+    }
+
+    // frame 内没有上一条历史：退回 referrer，再退回主页。
+    if (useful) { location.href = ref; return; }
+    goHome();
   }
 
   // 把筛选项（年份按钮 + 搜索）包成一条工具条，别散在页面上
@@ -3899,13 +3914,41 @@ html.soj-content textarea.soj-editor::-moz-selection{
     if (!urlInput || !secInput) return;
     if (!urlInput.value) return;
 
-    // 唯一要做的事：后台同步立刻、长时间让出限流配额（180s），让用户
-    // 这一次「等待页 → 列表」能正常进行。之后绝不替换站点自带的倒计时，
-    // 让站点自己的 init(2s 后)→ 数 6s → goToUrl 用 window.location 跳列表，
-    // 正是用户要的"6 秒倒计时结束直接看到提交列表"。（之前的版本在这里
-    // 另起倒计时并 location.replace，会和站点自己的倒计时并发、各跳一次，
-    // 反而多打了列表请求，把限流重新触发。）
+    // ⓪ 兜底：如果这个 DELAY 页是被「浏览器返回」回到的（历史里残留的中转条目），
+    //    绝不能再按倒计时 forward 回列表（那会让列表↔题目来回打转）。
+    //    立刻继续向后退，把 DELAY 这一条跳过，让用户停在真正的来源页。
+    try {
+      const nav = (performance.getEntriesByType &&
+                   performance.getEntriesByType('navigation')[0]) || {};
+      if (nav.type === 'back_forward') {
+        setTimeout(function () { try { history.back(); } catch (e) {} }, 30);
+        return;
+      }
+    } catch (e) { /* ignore */ }
+
+    // ① 后台同步立刻、长时间让出限流配额（180s），让用户这一次「等待页 → 列表」
+    //    能正常进行。不替换站点自带的倒计时（站点自己的 init→数 6s→goToUrl）。
     try { yieldSyncToUser(180000); } catch (e) {}
+
+    // ② 把站点倒计时结束后的跳转从 window.location=url（push，会在 iframe 历史
+    //    里留下一条 DELAY 记录）改成 location.replace(url)。
+    //    DELAY 是临时中转页，一旦留在历史里，用户在「列表」点返回会回到 DELAY，
+    //    DELAY 又自动 forward 到列表，就形成「题目 ↔ 列表」点返回出不去的死循环。
+    //    改用 replace 后，历史里只剩 [来源页, 列表]，返回直接回到来源页。
+    //    站点脚本运行在页面上下文（沙箱里直接改 window.goToUrl 不生效），
+    //    所以注入一个 <script> 到页面里覆盖全局 goToUrl；DOMContentLoaded 时
+    //    站点已声明该函数、但 8 秒倒计时还没走到跳转，此刻覆盖正好生效。
+    try {
+      const code =
+        '(function(){' +
+        'function __sojGo(){var u=document.getElementById("url");if(u&&u.value){window.location.replace(u.value);}}' +
+        'try{window.goToUrl=__sojGo;}catch(e){}' +
+        '})();';
+      const tag = document.createElement('script');
+      tag.textContent = code;
+      (document.head || document.documentElement).appendChild(tag);
+      if (tag.parentNode) tag.parentNode.removeChild(tag);
+    } catch (e) { /* ignore */ }
   }
 
   /* ================================================================
@@ -4345,15 +4388,29 @@ html.soj-content textarea.soj-editor::-moz-selection{
       const file = p.substring(slash + 1);
       const delay = DELAY_MAP[file];
       if (!delay) return null;
-      return p.substring(0, slash + 1) + delay + location.search;
+      // 冷却页 URL 会带 ?waitForSeconds=N（且可能是重定向后的 URL），
+      // 这个参数不能原样带给 DELAY 页；只保留 userId / problemId / page 等真正参数。
+      let qs = '';
+      try {
+        const kept = (location.search || '').replace(/^\?/, '')
+          .split('&')
+          .filter(function (kv) {
+            const k = kv.split('=')[0];
+            return k && !/^(waitForSeco|waitForSeconds|t)$/i.test(k);
+          });
+        if (kept.length) qs = '?' + kept.join('&');
+      } catch (e) { qs = ''; }
+      return p.substring(0, slash + 1) + delay + qs;
     } catch (e) { return null; }
   }
 
   // 限流重试：重新走 DELAY 等待页（正确的"等完再跳"流程），而不是
   // 直接 reload PUBLIC（那会再次被回主页框架页、陷入无限等待）。
+  // 用 replace：把"限流/冷却页"本身从历史里替换掉，否则冷却页会留在历史中，
+  // 用户点返回时又回到冷却页、它又自动重试，形成新的返回死循环。
   function retryListNavigation() {
     const d = currentDelayUrl();
-    if (d) location.href = d;
+    if (d) location.replace(d);
     else location.reload();
   }
 
@@ -4541,8 +4598,9 @@ html.soj-content textarea.soj-editor::-moz-selection{
   }
 
   // 自包含等待页：frameset 文档没有 body，只能整页重写。
-  // 倒计时结束【重新走 DELAY 等待页】（location.href = delayUrl），由 DELAY
+  // 倒计时结束【重新走 DELAY 等待页】（location.replace(delayUrl)），由 DELAY
   // 倒计时后正确跳进列表；绝不直接 reload PUBLIC（会被回主页框架页），也绝不跳主页。
+  // 用 replace 而不是 href，避免把限流页 / 等待页留在历史里导致返回死循环。
   function hardStandaloneHtml(secs, stopped, delayUrl) {
     const target = delayUrl ? JSON.stringify(delayUrl) : 'null';
     const css =
@@ -4555,7 +4613,7 @@ html.soj-content textarea.soj-editor::-moz-selection{
     const body = stopped
       ? '<div class="t">这个页面还是被限流了</div>' +
         '<div class="s">已暂停后台自动重试，避免反复撞限流。<br>稍等一会儿（限流通常几分钟内自动解除），再点下面按钮进入提交列表。</div>' +
-        '<button onclick="(function(){try{sessionStorage.removeItem(\'soj-cool:\'+location.pathname+location.search);}catch(e){}var u=' + target + ';if(u){location.href=u;}else{location.reload();}})()">再试一次</button>'
+        '<button onclick="(function(){try{sessionStorage.removeItem(\'soj-cool:\'+location.pathname+location.search);}catch(e){}var u=' + target + ';if(u){location.replace(u);}else{location.reload();}})()">再试一次</button>'
       : '<div class="num"><b id="n">' + secs + '</b><span>秒</span></div>' +
         '<div class="t">服务器限流，稍等自动重试</div>' +
         '<div class="s">已暂停后台同步并拦住跳转，不会把你带回主页。<br>倒计时结束会重新等待并进入提交列表，无需手动刷新。</div>' +
@@ -4565,7 +4623,7 @@ html.soj-content textarea.soj-editor::-moz-selection{
       : '<script>(function(){var n=' + secs + ';var u=' + target + ';var el=document.getElementById("n");var b=document.getElementById("b");' +
         'var total=n*1000,end=Date.now()+total;var t=setInterval(function(){var l=Math.max(0,end-Date.now());' +
         'if(el)el.textContent=Math.ceil(l/1000);if(b)b.style.width=(l/total*100)+"%";' +
-        'if(l<=0){clearInterval(t);if(u){location.href=u;}else{location.reload();}}},200);})();<\/script>';
+        'if(l<=0){clearInterval(t);if(u){location.replace(u);}else{location.reload();}}},200);})();<\/script>';
     return '<!doctype html><html><head><meta charset="utf-8"><meta name="soj-hard" content="wait">' +
       '<title>服务器限流</title><style>' + css +
       '</style></head><body><div class="card">' + body + '</div>' + js + '</body></html>';
